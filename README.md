@@ -95,6 +95,16 @@ The executable is written to `dist\ps3-rpcs3-game-updater.exe`. See [BUILD_EXE.m
 
 The app uses Sony’s public PS3 update metadata and package endpoints. It checks downloaded package SHA-1 values supplied by that metadata, and RPCS3 validates packages when installing them. Sony’s legacy endpoint certificate behavior is documented in [SECURITY.md](SECURITY.md).
 
+## Feedback & Support
+
+Found a bug, hit a snag, or want a feature? I want to know — that feedback is what shapes the next build.
+
+- **Report an issue** — open a [GitHub issue](https://github.com/Johnzx07/ps3-rpcs3-game-updater/issues) with the game's title ID, what you expected, and what happened. Include an error screenshot if you have one.
+- **Quick help / community** — join the [NGP "Bench" Discord](#) and ask in the help channel.
+- **Guides** — walkthroughs on [The New Game+ (YouTube)](#).
+
+The app never touches game files beyond the per-game package folder, and it uses only Sony's public update metadata — see [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
