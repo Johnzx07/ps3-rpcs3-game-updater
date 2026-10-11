@@ -5,9 +5,14 @@ import hashlib
 import os
 import re
 import threading
+import time
 from typing import Optional
 
-from PIL import Image, ImageDraw
+try:  # Pillow is optional: art degrades to text placeholders without it
+    from PIL import Image, ImageDraw
+except ImportError:  # pragma: no cover
+    Image = None
+    ImageDraw = None
 
 try:  # Pillow >= 9.2 ships the textsize helper; older versions use textbbox
     from PIL.ImageFont import load_default as _load_default_font
@@ -17,6 +22,14 @@ except Exception:  # pragma: no cover
 
 _CACHE_DIRNAME = "art_cache"
 _REMOTE_RE = re.compile(r"https?://[^\s\"']+\.(?:png|jpg|jpeg|webp)", re.I)
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+
+# Remote box art comes from Sony's public keyless TMDB endpoint (the same one
+# RPCS3's Discord bot uses) through the verified updater.psn adapter. The
+# PlayStation Store web API paths were probed live (2026-10) and are dead
+# (404/403 from plain clients), so they are not used. TMDB entries are not
+# contractual either — cache-first, throttled, and never raising.
+_MIN_REQUEST_GAP = 1.0  # courtesy throttle for remote metadata
 
 
 def cache_dir(base_dir: str) -> str:
@@ -35,7 +48,7 @@ def _cache_path(serial: str, base_dir: str) -> str:
 
 def find_local_icon(game_path: str) -> Optional[str]:
     """Return the first usable ICON0 image inside a game folder, if any."""
-    if not game_path or not os.path.isdir(game_path):
+    if Image is None or not game_path or not os.path.isdir(game_path):
         return None
     for root, _dirs, files in os.walk(game_path):
         depth = root[len(os.path.normpath(game_path)):].count(os.sep)
@@ -57,6 +70,8 @@ def find_local_icon(game_path: str) -> Optional[str]:
 
 
 def load_image(path: str, size=(360, 500)) -> Optional["Image.Image"]:
+    if Image is None:
+        return None
     try:
         with Image.open(path) as im:
             im = im.convert("RGBA")
@@ -67,6 +82,8 @@ def load_image(path: str, size=(360, 500)) -> Optional["Image.Image"]:
 
 
 def save_cached(serial: str, image: "Image.Image", base_dir: str) -> Optional[str]:
+    if Image is None:
+        return None
     try:
         path = _cache_path(serial, base_dir)
         image.save(path, "PNG")
@@ -84,11 +101,13 @@ def load_cached(serial: str, base_dir: str) -> Optional["Image.Image"]:
 
 def fetch_remote_artwork(url: str, timeout: float = 6.0) -> Optional["Image.Image"]:
     """Best-effort remote artwork download. Never raises."""
+    if Image is None:
+        return None
     try:
         import urllib.request
 
         req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            url, headers={"User-Agent": _UA}
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read(8 * 1024 * 1024)
@@ -102,9 +121,9 @@ def fetch_remote_artwork(url: str, timeout: float = 6.0) -> Optional["Image.Imag
 
 def extract_remote_url(text: str) -> Optional[str]:
     if not text:
-        m = _REMOTE_RE.search(text)
-        return m.group(0) if m else None
-    return None
+        return None
+    m = _REMOTE_RE.search(text)
+    return m.group(0) if m else None
 
 
 class ArtworkResolver:
@@ -119,6 +138,8 @@ class ArtworkResolver:
         self.allow_remote = allow_remote
         self._lock = threading.Lock()
         self._inflight = set()
+        self._missed = set()  # title IDs confirmed to have no store art
+        self._last_request = 0.0
 
     def resolve_local(self, game) -> Optional["Image.Image"]:
         icon = find_local_icon(game.path) if getattr(game, "path", "") else None
@@ -130,6 +151,59 @@ class ArtworkResolver:
         if getattr(game, "serial", ""):
             return load_cached(game.serial, self.base_dir)
         return None
+
+    def resolve_remote_by_serial(self, serial: str, name: str = "") -> Optional["Image.Image"]:
+        """Best-effort cover art for titles not installed in RPCS3 (no local ICON0).
+
+        Source is Sony's public keyless TMDB endpoint (same as RPCS3's Discord
+        bot), reached through the verified updater.psn adapter: title ID ->
+        display name + box-art URL. TMDB entries are not contractual — some
+        titles have no entry at all — so this is cache-first, throttled,
+        memoizes misses, and never raises; the placeholder remains the caller's
+        final fallback.
+        """
+        if Image is None or not self.allow_remote:
+            return None
+        serial = (serial or "").strip().upper()
+        if not serial:
+            return None
+        cached = load_cached(serial, self.base_dir)
+        if cached:
+            return cached
+
+        with self._lock:
+            if serial in self._missed or serial in self._inflight:
+                return None
+            self._inflight.add(serial)
+        try:
+            now = time.time()
+            with self._lock:
+                gap = _MIN_REQUEST_GAP - (now - self._last_request)
+            if gap > 0:
+                time.sleep(gap)
+            with self._lock:
+                self._last_request = time.time()
+
+            from . import psn  # verified lookup logic; no import cycle (psn never imports artwork)
+            import io
+
+            meta_name, icon_url = psn.fetch_meta(serial, timeout=12)
+            data = psn.download_icon(icon_url, timeout=15)
+            if not data:
+                with self._lock:
+                    self._missed.add(serial)
+                return None
+            im = Image.open(io.BytesIO(data))
+            im.load()
+            save_cached(serial, im, self.base_dir)
+            return im
+        except Exception:  # noqa: BLE001 - remote art is best-effort
+            with self._lock:
+                self._missed.add(serial)
+            return None
+        finally:
+            with self._lock:
+                self._inflight.discard(serial)
 
     def resolve_remote(self, game, url: str, on_done=None):
         """Kick off an optional remote fetch; calls on_done(serial, image|None)."""
@@ -158,8 +232,10 @@ class ArtworkResolver:
         threading.Thread(target=_work, daemon=True).start()
 
 
-def make_placeholder(title: str = "", size=(360, 500)) -> "Image.Image":
+def make_placeholder(title: str = "", size=(360, 500)) -> Optional["Image.Image"]:
     """Generate a refined dark placeholder tile with the game's initials."""
+    if Image is None or ImageDraw is None:
+        return None
     w, h = size
     img = Image.new("RGBA", (w, h), (24, 28, 38, 255))
     d = ImageDraw.Draw(img)

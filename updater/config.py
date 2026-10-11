@@ -24,6 +24,11 @@ def save(cfg: dict):
     _orig.save_config(cfg)
 
 
+def config_dir():
+    """The verified app data folder (where config.ini and errors.log live)."""
+    return _orig.config_dir()
+
+
 def default_downloads_dir() -> str:
     return os.path.join(os.path.expanduser("~"), "PS3Updates")
 

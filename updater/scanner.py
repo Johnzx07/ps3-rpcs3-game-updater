@@ -80,43 +80,116 @@ def detect_rpcs3_dir() -> Optional[str]:
 # games.yml parsing (minimal YAML, no external dependency)
 # --------------------------------------------------------------------------- #
 
+_TITLE_ID_RE = re.compile(r"^[A-Z0-9]{9}$")
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _title_from_path(path: str) -> str:
+    """Derive a display name from a game path, e.g. '.../Game [BLUS12345]/' -> 'Game'."""
+    parts = [p for p in path.replace("\\", "/").split("/") if p and not p.endswith(":")]
+    cand = next((p for p in reversed(parts) if p.lower() != "game"), "")
+    return re.sub(r"\s*\[[A-Z0-9]{9}\]\s*$", "", cand).strip()
+
+
 def parse_games_yml(text: str) -> List[Dict[str, str]]:
-    """Parse the simple list-of-mappings format used by RPCS3's games.yml."""
+    """Parse RPCS3's games.yml without an external dependency.
+
+    Supported shapes:
+      game:                                   # current RPCS3 root key
+        BLUS12345: D:/ROMS/... [BLUS12345]/   # flat — value is the game path
+        BLUS12345:
+          name: Game Name
+          path: D:/...
+      BLUS12345: path                         # legacy top-level mapping
+      - serial: BLUS12345                     # legacy list of mappings
+    """
     entries: List[Dict[str, str]] = []
     current: Optional[Dict[str, str]] = None
+    in_game_root = False
+
+    def new_entry(serial: str = "") -> Dict[str, str]:
+        nonlocal current
+        current = {"serial": serial, "title": "", "path": "", "version": ""}
+        return current
+
+    def finish():
+        nonlocal current
+        if current is not None and current.get("serial"):
+            entries.append(current)
+        current = None
+
+    def assign(e: Dict[str, str], key: str, value: str):
+        if key == "name" or key == "title":
+            e["title"] = value or e["title"]
+        elif key == "path":
+            e["path"] = value
+        elif key == "serial":
+            e["serial"] = value.upper()
+        elif key == "version":
+            e["version"] = value
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
         if not line or line.lstrip().startswith("#"):
             continue
         stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
         if stripped.startswith("- "):
-            if current is not None:
-                entries.append(current)
-            current = {}
-            stripped = stripped[2:].strip()
-            if not stripped:
+            finish()
+            current = new_entry()
+            in_game_root = False
+            item = stripped[2:].strip()
+            if ":" in item:
+                key, _, value = item.partition(":")
+                assign(current, key.strip().strip("\"'").lower(), _unquote(value))
+            continue
+
+        if ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        key = key.strip().strip("\"'").lower()
+        value = _unquote(value)
+
+        if indent == 0:
+            finish()
+            if key == "game" and not value:
+                in_game_root = True  # entries come from the indented children
                 continue
-        elif current is None or not raw_line[:1].isspace():
-            # A top-level key outside a list item ends the previous entry.
-            if current is not None and ":" in stripped:
-                entries.append(current)
-                current = {}
-            else:
-                continue
+            in_game_root = False
+            e = new_entry(key.upper() if _TITLE_ID_RE.match(key.upper()) else "")
+            if value:
+                # Flat mapping form: the value itself is the path (or a name).
+                if "/" in value or "\\" in value:
+                    e["path"] = value
+                else:
+                    e["title"] = value
+            continue
 
-        if ":" in stripped:
-            key, _, value = stripped.partition(":")
-            key = key.strip().lower()
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            if current is not None:
-                current[key] = value
+        # Indented child: under 'game:' a title-ID key starts a new entry;
+        # anything else is a field of the entry above it.
+        if _TITLE_ID_RE.match(key.upper()):
+            finish()
+            e = new_entry(key.upper())
+            if value:
+                # Flat form: the value itself is the path (or a name).
+                if "/" in value or "\\" in value:
+                    e["path"] = value
+                else:
+                    e["title"] = value
+        elif current is not None:
+            assign(current, key, value)
 
-    if current is not None:
-        entries.append(current)
-
+    finish()
+    for e in entries:
+        if not e.get("title") and e.get("path"):
+            e["title"] = _title_from_path(e["path"])
     return [e for e in entries if any(e.values())]
 
 
@@ -159,38 +232,72 @@ def load_games_yml(rpcs3_dir: str) -> List[Dict[str, str]]:
 # --------------------------------------------------------------------------- #
 
 def read_sfo_strings(path: str) -> Dict[str, str]:
-    """Read string values from a PS3 PARAM.SFO file. Returns {} on failure."""
+    """Read string values from a PS3 PARAM.SFO file. Returns {} on failure.
+
+    Classic (PS3 game) SFO layout: 32-byte little-endian header
+    (magic, version, maxent, entry_size, nument, key_len, data_len, padding),
+    entry table starting immediately after at offset 32. VITA 'PSF\\0' files use
+    a different layout and are out of scope — they simply return {}.
+    """
     try:
         with open(path, "rb") as fh:
             data = fh.read(1024 * 1024)
     except OSError:
         return {}
-    if len(data) < 64 or data[:4] != b"SFB\x00":
+    if len(data) < 32 or data[:4] != b"SFB\x00":
         return {}
     try:
-        _version, max_entries, entry_size, num_entries = struct.unpack_from("<IIII", data, 8)
+        _magic, _version, max_entries, entry_size, num_entries, key_len, data_len = struct.unpack_from("<7I", data, 0)
     except struct.error:
         return {}
-    if not (1 <= num_entries <= max_entries and 32 <= entry_size <= 512):
+    if not (1 <= num_entries <= max_entries and 25 <= entry_size <= 512):
         return {}
 
-    out: Dict[str, str] = {}
-    base = 64
-    for i in range(num_entries):
-        off = base + i * entry_size
-        if off + entry_size > len(data):
-            break
-        key_end = data.index(b"\x00", off, min(off + 16, len(data)))
-        key = data[off:key_end].decode("ascii", "ignore").strip()
-        if not key:
-            continue
-        _type, size, value_off = struct.unpack_from("<BII", data, off + 16)
-        if _type != 0x01 or value_off + size > len(data):
-            continue
-        raw_val = data[value_off:value_off + size]
-        val_end = raw_val.find(b"\x00")
-        out[key] = (raw_val[:val_end] if val_end >= 0 else raw_val).decode("utf-8", "ignore").strip()
-    return out
+    base = 32  # entry table follows the 32-byte header
+
+    def probe(fmt_width: int, offset_first: bool) -> Optional[Dict[str, str]]:
+        """Try one entry layout; return strings only if every entry validates."""
+        entry_min = 16 + fmt_width + 8  # key[16] + format + offset + size
+        if entry_size < entry_min:
+            return None
+        out: Dict[str, str] = {}
+        for i in range(num_entries):
+            off = base + i * entry_size
+            if off + entry_min > len(data):
+                return None
+            key_end = data.find(b"\x00", off, off + 16)
+            key = data[off:key_end if key_end >= 0 else off + 16].decode("ascii", "ignore").strip()
+            # SFO keys are ASCII identifiers (NAME, TITLE_ID, PARENTAL_LEVEL...).
+            if not key or not all(c.isalnum() or c == "_" for c in key):
+                return None
+            if fmt_width == 1:
+                fmt, a, b = struct.unpack_from("<BII", data, off + 16)
+            else:
+                fmt, a, b = struct.unpack_from("<III", data, off + 16)
+            if offset_first:
+                value_off, size = a, b
+            else:
+                size, value_off = a, b
+            if fmt not in (0x01, 0x02, 0x04) or value_off < base or value_off + size > len(data):
+                return None
+            if fmt == 0x02:
+                continue  # integer value; we only read strings
+            raw = data[value_off:value_off + size]
+            nul = raw.find(b"\x00")
+            text = (raw[:nul] if nul >= 0 else raw).decode("utf-8", "ignore").strip()
+            if any(ord(c) < 0x20 for c in text):
+                return None  # binary where a string was expected: wrong layout
+            out[key] = text
+        return out or None
+
+    # Canonical PSDevWiki entry is key[16], format, offset, size. Probe the
+    # common producer variants (u8/u32 format, swapped fields); the first
+    # layout that validates for every entry wins.
+    for fmt_width, offset_first in ((1, True), (4, True), (1, False), (4, False)):
+        result = probe(fmt_width, offset_first)
+        if result:
+            return result
+    return {}
 
 
 # --------------------------------------------------------------------------- #

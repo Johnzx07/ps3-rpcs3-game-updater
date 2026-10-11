@@ -13,8 +13,10 @@ import os
 import queue as _queue
 import subprocess
 import sys
+import threading
 import ctypes
 import tkinter as tk
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
@@ -35,13 +37,35 @@ except ImportError:  # pragma: no cover
     _ImageTk = None
 
 from updater.artwork import make_placeholder
-from updater.config import default_downloads_dir, load as load_config, save as save_config
+from updater.config import (
+    config_dir,
+    default_downloads_dir,
+    load as load_config,
+    save as save_config,
+)
 from updater.engine import UpdateEngine
 from updater.models import is_valid_serial, normalize_serial
 from updater.psn import fmt_size
 
+
+def _log_uncaught(exc: BaseException, where: str):
+    """Persist an unexpected error to errors.log in the app data folder.
+
+    Windowed PyInstaller builds have no console, so anything that escapes the
+    guarded paths would otherwise vanish silently. This keeps those failures
+    diagnosable (the GUI log panel mirrors the most common ones too).
+    """
+    try:
+        path = Path(config_dir()) / "errors.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {where}: {exc!r}\n")
+    except Exception:  # noqa: BLE001 - logging must never raise
+        pass
+
+
 APP_TITLE = "PS3 RPCS3 Game Updater"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 # These assets are bundled alongside the executable by ps3-rpcs3-game-updater.spec.
 # Keep the source and frozen-app lookup identical by resolving from this module.
 BRAND_PNG = os.path.join(_ROOT, "assets", "logo_header.png")
@@ -160,13 +184,18 @@ class GameTile(tk.Frame):
 
         if dl is not None:
             total_pkgs = max(1, dl["total"])
-            frac = (dl["index"] + min(1.0, dl["done"] / max(1, dl["total_bytes"]))) / total_pkgs
+            total_bytes = max(1, dl["total_bytes"])
+            # dl["done"] counts bytes for the CURRENT package only; the handler
+            # banks finished packages into done_before, so per-package size
+            # differences no longer distort the fraction (e.g. 62.5% for 37.5%).
+            done_bytes = min(dl.get("done_before", 0) + dl.get("done", 0), total_bytes)
+            frac = done_bytes / total_bytes
             self.progress.configure(maximum=1000, value=int(frac * 1000))
             if not self.progress.winfo_ismapped():
                 self.progress.pack(fill="x", padx=12, pady=(6, 0), before=self.size_label)
             self.status_label.configure(text=f"Downloading pkg {min(dl['index'] + 1, total_pkgs)} of {total_pkgs}", fg=C_ACCENT_HI)
             self.size_label.configure(
-                text=fmt_size(dl["done"]) + (" / " + fmt_size(dl["total_bytes"]) if dl["total_bytes"] else "")
+                text=fmt_size(done_bytes) + (" / " + fmt_size(dl["total_bytes"]) if dl["total_bytes"] else "")
             )
             self.update_btn.configure(state="disabled")
             self.cancel_btn.configure(state="normal")
@@ -211,7 +240,13 @@ def _flat_button(parent, text, command, accent=False):
 
 # -------------------------------------------------------------------- app ---
 class PS3RPCS3GameUpdaterApp:
-    FILTERS = (("all", "All"), ("update", "Need update"), ("updated", "Up to date"), ("error", "Errors"))
+    FILTERS = (
+        ("all", "All"),
+        ("installed", "Installed"),
+        ("update", "Need update"),
+        ("updated", "Up to date"),
+        ("error", "Errors"),
+    )
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -229,6 +264,7 @@ class PS3RPCS3GameUpdaterApp:
         self.query = ""
         self.lookup_state: dict = {}      # serial -> checking|ok|error
         self.lookup_errors: dict = {}     # serial -> message
+        self._pinned_serial = ""          # last Title ID checked: its card always shows
         self.downloading: dict = {}       # serial -> progress info
         self._dl_queue: list = []
         self.tiles: dict = {}             # serial -> GameTile
@@ -454,9 +490,23 @@ class PS3RPCS3GameUpdaterApp:
 
     def _matches(self, game):
         q = self.query.strip().lower()
-        if q and q not in game.display_title.lower() and q not in game.serial.lower():
-            return False
+        if q:
+            # Match what the card actually shows, including names fetched from
+            # TMDB for titles that were not in games.yml.
+            name = self.engine.names.get(game.serial, game.display_title)
+            if q not in name.lower() and q not in game.serial.lower():
+                return False
         if self.filter == "all":
+            return True
+        if self.filter == "installed":
+            # Installed means the game exists in the scanned RPCS3 library, so a
+            # title resolved only by Title ID does not belong in this view.
+            return bool(game.path)
+        # A title checked by Title ID must stay visible while its state is
+        # unknown: every status filter hides cards whose state is still
+        # "checking", which is why a checked card could never appear while
+        # another status filter was active.
+        if game.serial == self._pinned_serial:
             return True
         return self._game_status(game) == self.filter
 
@@ -465,15 +515,21 @@ class PS3RPCS3GameUpdaterApp:
         self._rebuild_tiles()
 
     def search_library(self):
-        """Filter the scanned library by game title or title ID.
+        """Find a game by title, or look it up when the box holds a Title ID.
 
-        This is intentionally separate from ``check_title_id``, which queries
-        Sony for one exact nine-character title ID.  Library search stays local
-        and is instant, making it practical to find a game by its displayed
-        title before opening Details or downloading updates.
+        Text is matched against the library — the names shown on the cards,
+        including names resolved from Sony's TMDB — so typing a title once is
+        enough. A nine-character Title ID is treated as a lookup instead of a
+        filter, because library text can only match titles the app already knows
+        about: a game that is not installed has no entry to match against, so the
+        Title ID is the only universal handle for it.
         """
+        query = self.search_var.get().strip()
+        if is_valid_serial(query):
+            self.check_var.set(normalize_serial(query))
+            self.check_title_id()
+            return
         self._apply_filter()
-        query = self.query.strip()
         if query:
             shown = len(self._visible_games())
             self._set_status(f"{shown} game(s) match “{query}”.")
@@ -490,6 +546,7 @@ class PS3RPCS3GameUpdaterApp:
     def _rebuild_tiles(self):
         for w in self.grid_frame.winfo_children():
             w.destroy()
+        self._empty_box = None  # the empty-state box, if any, was destroyed above
         self.tiles = {}
         games = self._visible_games()
         cols = max(1, (max(300, self.canvas.winfo_width()) - 24) // (TILE_W + 20))
@@ -525,9 +582,9 @@ class PS3RPCS3GameUpdaterApp:
             tile.grid(row=i // cols, column=i % cols, padx=10, pady=10, sticky="n")
 
     def _toggle_empty_state(self, show: bool):
-        existing = self.grid_frame.nametowidget("empty_state") if "empty_state" in [w.winfo_name() for w in self.grid_frame.winfo_children()] else None
-        if show and existing is None:
-            box = tk.Frame(self.grid_frame, bg=C_BG)
+        if show and self._empty_box is None:
+            box = tk.Frame(self.grid_frame, bg=C_BG, name="empty_state")
+            self._empty_box = box
             box.grid(row=0, column=0, columnspan=8, pady=60)
             inner = tk.Frame(box, bg=C_CARD, highlightbackground=C_BORDER, highlightthickness=1)
             inner.pack(padx=40, pady=32)
@@ -561,6 +618,20 @@ class PS3RPCS3GameUpdaterApp:
             elif not self.downloading.get(s):
                 t.configure(highlightbackground=C_BORDER)
         self._refresh_details()
+
+    def _scroll_to_serial(self, serial: str):
+        """Bring a game card into view. Cosmetic, so it must never raise."""
+        tile = self.tiles.get(serial)
+        if tile is None:
+            return
+        try:
+            tile.update_idletasks()
+            bbox = self.canvas.bbox("all")
+            height = max(1, int(bbox[3])) if bbox else 1
+            y = max(0, int(tile.winfo_y()))
+            self.canvas.yview_moveto(min(1.0, y / height))
+        except Exception:  # noqa: BLE001 - scrolling must not break the UI
+            pass
 
     def show_details(self, serial: str):
         """Open the in-window sidebar for a game card's details."""
@@ -627,8 +698,13 @@ class PS3RPCS3GameUpdaterApp:
             return
         try:
             os.startfile(str(folder))  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 - non-Windows fallback
-            subprocess.Popen(["xdg-open", str(folder)])
+        except AttributeError:  # non-Windows fallback
+            try:
+                subprocess.Popen(["xdg-open", str(folder)])
+            except OSError:  # no file opener available on this system
+                self._log("Could not open the download folder (no file opener available).")
+        except Exception:  # noqa: BLE001
+            self._log("Could not open the download folder.")
 
     def _offer_rpcs3_install(self, serial: str, completed_paths):
         """Ask once, after a successful download, before opening RPCS3's installer."""
@@ -773,9 +849,19 @@ class PS3RPCS3GameUpdaterApp:
         self.check_var.set(serial)
         self.lookup_errors.pop(serial, None)
         self.lookup_state.pop(serial, None)
+        # Checking a Title ID must jump straight to that game. Clear the library
+        # search and the status filter — a status filter hides every card whose
+        # state is not known yet, so a checked title could never appear — pin the
+        # serial, rebuild, and bring its card into view.
+        self.search_var.set("")
+        self.query = ""
+        self._pinned_serial = serial
+        self._set_filter("all")
         self._set_status(f"Checking updates for {serial}…")
         self._log(f"Checking updates for {serial}…")
         self.engine.check_title_id(serial)
+        self.select_game(serial)
+        self._scroll_to_serial(serial)
 
     def request_download(self, serial: str):
         if not serial or serial in self.downloading:
@@ -806,7 +892,8 @@ class PS3RPCS3GameUpdaterApp:
             pkgs = self.engine.updates[serial]
             self.downloading[serial] = {
                 "index": 0, "total": len(pkgs),
-                "done": 0, "total_bytes": sum(u.size_bytes for u in pkgs),
+                "done": 0, "done_before": 0,
+                "total_bytes": sum(u.size_bytes for u in pkgs),
             }
             name = self.engine.names.get(serial) or next(
                 (g.display_title for g in self.engine.library if g.serial == serial), serial
@@ -875,10 +962,14 @@ class PS3RPCS3GameUpdaterApp:
 
         def _save():
             changed = v_rpc.get() != self.engine.rpcs3_dir
+            try:
+                max_downloads = max(1, int(v_md.get() or 1))
+            except ValueError:  # e.g. a non-numeric spinbox value must not crash save
+                max_downloads = self.engine.max_downloads
             self.engine.configure(
                 rpcs3_dir=v_rpc.get().strip(),
                 downloads_dir=v_dl.get().strip() or default_downloads_dir(),
-                max_downloads=int(v_md.get() or 1),
+                max_downloads=max_downloads,
                 allow_remote_art=bool(art_var.get()),
             )
             save_config({
@@ -892,7 +983,7 @@ class PS3RPCS3GameUpdaterApp:
 
         btns = tk.Frame(dlg)
         btns.pack(fill="x", padx=18, pady=(4, 16))
-        _flat_button(btns, "Save & rescan" if True else "", _save, accent=True).pack(side="right")
+        _flat_button(btns, "Save & rescan", _save, accent=True).pack(side="right")
         _flat_button(btns, "Cancel", dlg.destroy).pack(side="right", padx=(0, 8))
 
     def rescan(self):
@@ -914,15 +1005,31 @@ class PS3RPCS3GameUpdaterApp:
                 kind, data = self.engine.events.get_nowait()
                 handler = getattr(self, f"_on_{kind}", None)
                 if handler is not None:
-                    handler(data)
+                    try:
+                        handler(data)
+                    except Exception as exc:  # noqa: BLE001 - one bad event must not kill the pump
+                        _log_uncaught(exc, f"event '{kind}'")
+                        try:
+                            self._log(f"UI error handling '{kind}': {exc}")
+                        except Exception:  # noqa: BLE001 - logging must never kill the pump
+                            pass
         except _queue.Empty:
             pass
         self.root.after(80, self._poll_events)
 
     def _refresh_tile(self, serial):
         t = self.tiles.get(serial)
-        if t is not None:
+        if t is None:
+            # The lookup resolved for a card that was never built: tiles only
+            # exist for games passing the current filter, so a title that was
+            # still "checking" when it was added had no card. Rebuild so the card
+            # appears as soon as the lookup finishes, then bring it into view.
+            self._rebuild_tiles()
+            t = self.tiles.get(serial)
+        else:
             t.refresh()
+        if t is not None and serial == self._pinned_serial:
+            self._scroll_to_serial(serial)
         if serial == self.selected_serial:
             self._refresh_details()
 
@@ -937,6 +1044,8 @@ class PS3RPCS3GameUpdaterApp:
         self._set_status(f"Checking updates for {game.serial}…")
         self._rebuild_tiles()
         self.select_game(game.serial)
+        if game.serial == self._pinned_serial:
+            self._scroll_to_serial(game.serial)
 
     def _on_scan_error(self, data):
         self.scan_progress.stop()
@@ -978,11 +1087,26 @@ class PS3RPCS3GameUpdaterApp:
     def _on_pkg_progress(self, data):
         info = self.downloading.get(data["serial"])
         if info is not None:
-            info["index"] = data["index"]
+            if data["index"] > info["index"]:
+                # The previous package finished — bank its bytes before moving on.
+                info["done_before"] = info.get("done_before", 0) + info.get("done", 0)
+                info["index"] = data["index"]
+                info["done"] = 0
             info["done"] = data["done"]
             if data["total"]:
                 info["total_bytes"] = max(info["total_bytes"], data["total"])
         self._refresh_tile(data["serial"])
+
+    def _on_art_ready(self, data):
+        """Apply remotely resolved cover art to the tile for that serial."""
+        serial = data["serial"]
+        img = data.get("image")
+        t = self.tiles.get(serial)
+        if t is None or img is None or _ImageTk is None:
+            return
+        t.set_image(img)
+        if t._photo is not None:
+            self._photos[serial] = t._photo
 
     def _on_download_finished(self, data):
         serial = data["serial"]
@@ -1006,6 +1130,15 @@ class PS3RPCS3GameUpdaterApp:
 
 # --------------------------------------------------------------------- main ---
 def main():
+    # Windowed frozen builds have no console: persist anything uncaught so a
+    # silent failure is still diagnosable from the app data folder.
+    def _hook(args):
+        _log_uncaught(args.exc_value, "uncaught")
+    sys.excepthook = _hook
+    try:
+        threading.excepthook = _hook
+    except AttributeError:  # pragma: no cover - pre-3.8 Pythons
+        pass
     root = tk.Tk()
     PS3RPCS3GameUpdaterApp(root)
     root.mainloop()

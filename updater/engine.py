@@ -62,6 +62,34 @@ class UpdateEngine:
     def _emit(self, kind: str, **data):
         self.events.put((kind, data))
 
+    def _attach_art(self, serial: str, image, game=None):
+        """Store resolved cover art and publish the documented `art_ready` event.
+
+        Priority: caller-supplied Sony icon bytes -> local ICON0/on-disk cache ->
+        remote TMDB box art via the resolver (cache-first and throttled; only
+        when the resolver allows remote). The GUI's placeholder remains the
+        final fallback.
+        """
+        if image is None and game is not None:
+            try:
+                image = self.resolver.resolve_local(game)
+            except Exception:  # noqa: BLE001 - local art is best-effort
+                image = None
+        if image is None:
+            try:
+                image = self.resolver.resolve_remote_by_serial(serial, self.names.get(serial, ""))
+            except Exception:  # noqa: BLE001 - remote art is best-effort
+                image = None
+        if image is None:
+            return
+        with self._lock:
+            self.art[serial] = image
+        try:
+            save_cached(serial, image, art_cache_dir(self.downloads_dir))
+        except Exception:  # noqa: BLE001 - cache write is best-effort
+            pass
+        self._emit("art_ready", serial=serial, image=image)
+
     def configure(
         self,
         rpcs3_dir: str = "",
@@ -89,10 +117,16 @@ class UpdateEngine:
     def _rescan_worker(self):
         try:
             rpcs3 = self.rpcs3_dir or detect_rpcs3_dir() or ""
-            with self._lock:
-                self.rpcs3_dir = rpcs3
             library = build_library(rpcs3) if rpcs3 else []
             with self._lock:
+                self.rpcs3_dir = rpcs3
+                # A title checked by Title ID is usually not in games.yml, so a
+                # rescan must keep it: otherwise the card, name, and artwork the
+                # user just looked up disappear as soon as the scan finishes.
+                manual = [g for g in self.library if g.source == "manual"]
+                seen = {g.serial for g in library}
+                library.extend(g for g in manual if g.serial not in seen)
+                library.sort(key=lambda g: (g.display_title.lower(), g.serial))
                 self.library = library
                 gone = {s for s in list(self.updates) if s not in {g.serial for g in library}}
                 for s in gone:
@@ -134,13 +168,8 @@ class UpdateEngine:
                     image.load()
                 except Exception:  # noqa: BLE001 - corrupt art must never break the scan
                     image = None
-            if image is not None:
-                with self._lock:
-                    self.art[serial] = image
-                try:
-                    save_cached(serial, image, art_cache_dir(self.downloads_dir))
-                except Exception:  # noqa: BLE001 - cache write is best-effort
-                    pass
+            game = next((g for g in self.library if g.serial == serial), None)
+            self._attach_art(serial, image, game)
 
             latest = updates[-1] if updates else None
             self._emit(
@@ -185,45 +214,44 @@ class UpdateEngine:
         threading.Thread(target=self._lookup_one_worker, args=(serial,), daemon=True).start()
 
     def _lookup_one_worker(self, serial: str):
-        """Fetch update metadata and artwork for a manually checked title."""
+        """Fetch update metadata and artwork for a manually checked title.
+
+        The whole body is guarded: in a windowed build an uncaught worker
+        exception is silent, so anything unexpected must surface as
+        ``lookup_error`` instead of leaving the card stuck on "Checking…".
+        """
         try:
             name, pkgs, meta_name, icon_bytes = lookup_with_meta(
                 serial, timeout=LOOKUP_TIMEOUT, rpcs3_dir=self.rpcs3_dir
             )
+
+            updates = [pkg_to_update(serial, pkg) for pkg in pkgs]
+            display_name = meta_name or name or ""
+            with self._lock:
+                self.updates[serial] = updates
+                self._pkgs[serial] = list(pkgs)
+                if display_name:
+                    self.names[serial] = display_name
+
+            image = None
+            if icon_bytes and _PILImage is not None:
+                try:
+                    image = _PILImage.open(io.BytesIO(icon_bytes))
+                    image.load()
+                except Exception:  # noqa: BLE001 - corrupt art must never break lookup
+                    image = None
+            game = next((g for g in self.library if g.serial == serial), None)
+            self._attach_art(serial, image, game)
+
+            self._emit(
+                "updates_found",
+                serial=serial,
+                name=display_name or None,
+                latest=updates[-1] if updates else None,
+                count=len(updates),
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced by the UI
             self._emit("lookup_error", serial=serial, error=str(exc))
-            return
-
-        updates = [pkg_to_update(serial, pkg) for pkg in pkgs]
-        display_name = meta_name or name or ""
-        with self._lock:
-            self.updates[serial] = updates
-            self._pkgs[serial] = list(pkgs)
-            if display_name:
-                self.names[serial] = display_name
-
-        image = None
-        if icon_bytes and _PILImage is not None:
-            try:
-                image = _PILImage.open(io.BytesIO(icon_bytes))
-                image.load()
-            except Exception:  # noqa: BLE001 - corrupt art must never break lookup
-                image = None
-        if image is not None:
-            with self._lock:
-                self.art[serial] = image
-            try:
-                save_cached(serial, image, art_cache_dir(self.downloads_dir))
-            except Exception:  # noqa: BLE001 - artwork caching is optional
-                pass
-
-        self._emit(
-            "updates_found",
-            serial=serial,
-            name=display_name or None,
-            latest=updates[-1] if updates else None,
-            count=len(updates),
-        )
 
     # --------------------------------------------------------------- downloads
     def start_download(self, serial: str):

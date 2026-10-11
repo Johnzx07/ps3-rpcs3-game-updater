@@ -1,3 +1,4 @@
 requests
 PyYAML
 Pillow
+psutil  # optional: detects a running RPCS3 instance; degrades gracefully if missing

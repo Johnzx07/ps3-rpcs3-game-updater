@@ -32,8 +32,11 @@ from pathlib import Path
 try:
     import requests
 except ImportError:
-    print("Missing dependency 'requests'. Install with:  pip install requests")
-    sys.exit(1)
+    # Raise instead of sys.exit(1): this module is imported by the GUI and the
+    # updater package, and exiting at import time kills the caller process.
+    raise ImportError(
+        "Missing dependency 'requests'. Install with:  pip install requests"
+    )
 
 # Pillow is optional: box-art thumbnails are an enhancement. A top-level (guarded)
 # import lets PyInstaller detect PIL + ImageTk statically, and the app still runs
@@ -161,6 +164,14 @@ def fmt_size(n):
         n /= 1024
 
 
+def _pkg_int(value) -> int:
+    """Sony size attrs are numeric strings; never crash on malformed ones."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def fetch_updates(title_id: str, timeout: int = 20):
     """Query Sony's PSN update endpoint.
 
@@ -212,7 +223,7 @@ def fetch_updates(title_id: str, timeout: int = 20):
         if url_:
             pkgs.append({
                 "version": ver,
-                "size": int(size_s or 0),
+                "size": _pkg_int(size_s),
                 "sha1": sha1.lower(),
                 "url": url_,
                 "drm_free": False,
@@ -229,7 +240,7 @@ def fetch_updates(title_id: str, timeout: int = 20):
                 continue
             pkgs.append({
                 "version": ver,
-                "size": int(size_s or 0),
+                "size": _pkg_int(size_s),
                 "sha1": sha1.lower(),
                 "url": url_,
                 "drm_free": True,
@@ -337,19 +348,27 @@ def lookup_with_meta(tid: str, timeout: int = 20, rpcs3_dir: str = ""):
     Art priority (mirrors the RPCS3 Discord bot's local-first design):
       1. locally installed game art (<rpcs3>/dev_hdd0/game/<id>/USRDIR/ICON0.PNG)
          — offline, instant; when present we skip the TMDB round-trip entirely
-      2. Sony TMDB box art (network) + display name — only when no usable local icon exists.
+      2. Sony TMDB box art (network) + display name — used when no usable local
+         icon exists, and also to name titles that have no published updates.
     """
     game_name, pkgs = fetch_updates(tid, timeout=timeout)
     meta_name, icon_bytes = "", None
-    if pkgs:  # only enrich when there's something to show
-        try:
-            icon_bytes = read_local_icon(rpcs3_dir, tid)
-            if not _valid_icon_bytes(icon_bytes):
-                meta_name, icon_url = fetch_meta(tid, timeout=timeout)
-                icon_bytes = download_icon(icon_url, timeout=15)
-                # keep the TMDB display name even when local art was used
-        except Exception:
-            pass
+    # Enrichment must NOT be gated on published updates: a title that is not
+    # installed in RPCS3, or has zero updates (e.g. a clean first-release-only
+    # title like NPUB31689), still deserves its display name and box art.
+    try:
+        icon_bytes = read_local_icon(rpcs3_dir, tid)
+        if _valid_icon_bytes(icon_bytes):
+            # Local art present; fetch only the TMDB name when there is nothing
+            # else to show — normal installed, updatable games still skip the
+            # TMDB round-trip entirely (documented behavior).
+            if not pkgs:
+                meta_name, _ = fetch_meta(tid, timeout=timeout)
+        else:
+            meta_name, icon_url = fetch_meta(tid, timeout=timeout)
+            icon_bytes = download_icon(icon_url, timeout=15)
+    except Exception:
+        pass
     return game_name, pkgs, meta_name, icon_bytes
 
 
@@ -362,6 +381,9 @@ def read_games_yml(rpcs3_dir: str):
       "BLUS12345":            (nested — newer RPCS3 builds)
         name: Game Name
         path: D:/...
+
+    Real RPCS3 installs nest everything under a top-level 'game:' key; that is
+    unwrapped first, and the legacy bare-mapping form still works.
     """
     import yaml  # local import so --cli works even if yaml is missing for GUI-only use
     yml = Path(rpcs3_dir) / "config" / "games.yml"
@@ -369,6 +391,8 @@ def read_games_yml(rpcs3_dir: str):
         raise FileNotFoundError(f"No games.yml at {yml}")
     with open(yml, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+    if isinstance(data, dict) and isinstance(data.get("game"), dict):
+        data = data["game"]
     out = {}
     for tid, info in data.items():
         name = ""
@@ -419,6 +443,15 @@ def download_pkg(pkg: dict, dest_dir: Path, progress_cb=None, stop_event=None):
     tmp = dest_dir / (fname + ".part")
 
     if final.exists() and final.stat().st_size == pkg["size"]:
+        # Verify the SHA-1 of the existing file too — skipping on size alone
+        # contradicts the hash-check policy documented above.
+        if pkg["sha1"]:
+            digest = sha1_of_file(final)
+            if digest != pkg["sha1"]:
+                return str(final), True, (
+                    f"already present, but SHA-1 differs from Sony's listing: "
+                    f"{digest[:8]}… vs {pkg['sha1'][:8]}…"
+                )
         return str(final), True, "already present"
 
     try:
@@ -959,6 +992,9 @@ def run_cli(serials, out_dir):
             print(f"   [{i}] v{p['version']}  {fmt_size(p['size'])}  {'DRM-free ' if p['drm_free'] else ''}{dest.name}")
 
         def cb(done, total):
+            if total <= 0:  # zero-length/unknown-size pkg: avoid ZeroDivisionError
+                print(f"\r      downloading {done/1048576:.1f} MB", end="", flush=True)
+                return
             print(f"\r      downloading {done/1048576:.1f}/{total/1048576:.1f} MB ({done/total*100:.0f}%)", end="", flush=True)
 
         for i, (p, dest) in enumerate(plan, 1):
@@ -975,7 +1011,11 @@ def run_cli(serials, out_dir):
 def main():
     # Silence urllib3 InsecureRequestWarning — emitted only by the two Sony PSN
     # requests above that use verify=False (see their TLS notes and README "Security").
-    requests.packages.urllib3.disable_warnings()
+    try:
+        import urllib3  # modern path; requests.packages.urllib3 is a deprecated shim
+        urllib3.disable_warnings()
+    except ImportError:
+        requests.packages.urllib3.disable_warnings()
     ap = argparse.ArgumentParser(description="PS3 RPCS3 Game Updater")
     ap.add_argument("--cli", nargs="+", metavar="SERIAL", help="headless mode: search+download given serials")
     ap.add_argument("-o", "--out", default=str(Path.home() / "PS3Updates"), help="output folder (CLI mode)")
