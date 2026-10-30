@@ -24,6 +24,7 @@ exe = EXE(
     [],
     name='ps3-rpcs3-game-updater',
     icon='assets/app.ico',
+    version='version_info.txt',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

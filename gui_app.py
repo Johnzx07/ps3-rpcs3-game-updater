@@ -65,7 +65,7 @@ def _log_uncaught(exc: BaseException, where: str):
 
 
 APP_TITLE = "PS3 RPCS3 Game Updater"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 # These assets are bundled alongside the executable by ps3-rpcs3-game-updater.spec.
 # Keep the source and frozen-app lookup identical by resolving from this module.
 BRAND_PNG = os.path.join(_ROOT, "assets", "logo_header.png")

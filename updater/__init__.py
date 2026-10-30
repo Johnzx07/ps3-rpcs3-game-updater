@@ -9,4 +9,4 @@ Modules:
     engine     – threaded orchestration emitting UI events on a queue
 """
 
-__version__ = "2.0.0"
+__version__ = "2.0.2"

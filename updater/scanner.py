@@ -247,22 +247,32 @@ def read_sfo_strings(path: str) -> Dict[str, str]:
     if len(data) < 32 or data[:4] != b"SFB\x00":
         return {}
     try:
-        _magic, _version, max_entries, entry_size, num_entries, key_len, data_len = struct.unpack_from("<7I", data, 0)
+        _magic, _version, header_size, data_start, num_entries, entry_stride, data_size = struct.unpack_from("<7I", data, 0)
     except struct.error:
         return {}
-    if not (1 <= num_entries <= max_entries and 25 <= entry_size <= 512):
+    # Canonical ps3devwiki PARAM.SFO fields: header_size is where the entry
+    # table starts (0x80 on real PS3 games), entry_stride is the per-entry
+    # size (46), data_start is where the string values live.
+    if not (1 <= num_entries <= 64):
         return {}
 
-    base = 32  # entry table follows the 32-byte header
+    # Producer variants differ in where the entry table sits and what stride
+    # it uses; probe the plausible (base, stride) pairs from the header.
+    candidates = []
+    for base, stride in ((header_size, entry_stride), (32, entry_stride),
+                         (32, data_start), (header_size, data_start)):
+        if 32 <= base <= 4096 and 25 <= stride <= 1024 and (base, stride) not in candidates:
+            candidates.append((base, stride))
 
-    def probe(fmt_width: int, offset_first: bool) -> Optional[Dict[str, str]]:
-        """Try one entry layout; return strings only if every entry validates."""
-        entry_min = 16 + fmt_width + 8  # key[16] + format + offset + size
-        if entry_size < entry_min:
+    def probe(fmt_width: int, mode: str, base: int, stride: int) -> Optional[Dict[str, str]]:
+        """Try one (base, stride, entry-field-order) layout. Returns strings
+        only if every entry validates; a validating layout is never guessed."""
+        entry_min = 16 + fmt_width + (12 if mode == "4int" else 8)
+        if stride < entry_min:
             return None
         out: Dict[str, str] = {}
         for i in range(num_entries):
-            off = base + i * entry_size
+            off = base + i * stride
             if off + entry_min > len(data):
                 return None
             key_end = data.find(b"\x00", off, off + 16)
@@ -272,16 +282,27 @@ def read_sfo_strings(path: str) -> Dict[str, str]:
                 return None
             if fmt_width == 1:
                 fmt, a, b = struct.unpack_from("<BII", data, off + 16)
+            elif mode == "4int":
+                fmt, _flag, a, b = struct.unpack_from("<4I", data, off + 16)
             else:
                 fmt, a, b = struct.unpack_from("<III", data, off + 16)
-            if offset_first:
-                value_off, size = a, b
+            if mode == "4int":
+                value_off, size = a, b          # key, format, flag, offset, size
+            elif mode == "off_first":
+                value_off, size = a, b          # key, format, offset, size
             else:
-                size, value_off = a, b
-            if fmt not in (0x01, 0x02, 0x04) or value_off < base or value_off + size > len(data):
+                size, value_off = a, b          # key, format, size, offset
+            if fmt not in (0x01, 0x02, 0x04):
                 return None
             if fmt == 0x02:
-                continue  # integer value; we only read strings
+                continue  # integer value stored inline; we only read strings
+            # Strings must point inside the file, past the entry table, with a
+            # real (NUL-terminated) payload: size 0 means the fields were read
+            # from the wrong offsets, i.e. a wrong layout.
+            if fmt == 0x04 and (size == 0 or value_off < base or value_off + size > len(data)):
+                return None
+            if fmt == 0x01 and (value_off < base or value_off + size > len(data)):
+                return None
             raw = data[value_off:value_off + size]
             nul = raw.find(b"\x00")
             text = (raw[:nul] if nul >= 0 else raw).decode("utf-8", "ignore").strip()
@@ -290,13 +311,16 @@ def read_sfo_strings(path: str) -> Dict[str, str]:
             out[key] = text
         return out or None
 
-    # Canonical PSDevWiki entry is key[16], format, offset, size. Probe the
-    # common producer variants (u8/u32 format, swapped fields); the first
-    # layout that validates for every entry wins.
-    for fmt_width, offset_first in ((1, True), (4, True), (1, False), (4, False)):
-        result = probe(fmt_width, offset_first)
-        if result:
-            return result
+    # Canonical PSDevWiki entry is key[16], format(u16), pad, flag(u32),
+    # offset(u32), size(u32) — probe that first, then producer variants
+    # (u8 format, no flag field, swapped offset/size). The first layout that
+    # validates for every entry wins.
+    for fmt_width, mode in ((4, "4int"), (4, "off_first"), (1, "off_first"),
+                            (4, "size_first"), (1, "size_first")):
+        for base, stride in candidates:
+            result = probe(fmt_width, mode, base, stride)
+            if result:
+                return result
     return {}
 
 
@@ -320,7 +344,7 @@ def _installed_version_from_folder(game_dir: str) -> Optional[str]:
                 if os.path.isfile(sfo):
                     return d
         # don't descend into PS3_GAME content trees deeper than needed
-        dirs[:] = [d for d in dirs if d.upper() not in ("PS3_GAME",)] or dirs[:16]
+        dirs[:] = [d for d in dirs if d.upper() != "PS3_GAME"][:16]
     return None
 
 

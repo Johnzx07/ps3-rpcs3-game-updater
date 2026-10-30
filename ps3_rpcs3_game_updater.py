@@ -118,10 +118,18 @@ def load_config() -> dict:
         if legacy.exists():
             path = legacy
     if path.exists():
-        cfg.read(path)
+        try:
+            cfg.read(path)
+        except Exception:
+            # A hand-edited/corrupted config (duplicate sections, bad syntax)
+            # must never brick startup — fall back to defaults.
+            cfg = configparser.ConfigParser()
     downloads = cfg.get("paths", "downloads", fallback=str(Path.home() / "PS3Updates"))
     rpcs3 = cfg.get("paths", "rpcs3", fallback="")
-    max_dl = cfg.getint("settings", "max_downloads", fallback=DEFAULT_MAX_DOWNLOADS)
+    try:
+        max_dl = cfg.getint("settings", "max_downloads", fallback=DEFAULT_MAX_DOWNLOADS)
+    except ValueError:
+        max_dl = DEFAULT_MAX_DOWNLOADS
     return {"downloads": downloads, "rpcs3": rpcs3, "max_downloads": max_dl}
 
 
@@ -478,6 +486,13 @@ def download_pkg(pkg: dict, dest_dir: Path, progress_cb=None, stop_event=None):
                     if progress_cb and (now - last_report > 0.15 or done == total):
                         progress_cb(done, total)
                         last_report = now
+
+        # A CDN can close the connection cleanly after a short body; with no
+        # SHA-1 on record nothing else catches the truncation, and the partial
+        # .pkg would be kept and reported "ok" (RPCS3's install then fails).
+        if total and done != total and not (pkg.get("sha1") or "").lower():
+            tmp.unlink(missing_ok=True)
+            return str(final), False, f"incomplete download ({done}/{total} bytes)"
 
         digest = sha1_of_file(tmp)
         if pkg["sha1"] and digest != pkg["sha1"]:

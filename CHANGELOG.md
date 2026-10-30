@@ -1,5 +1,22 @@
 # Changelog
 
+## [v2.0.2] - 2026-10-30 — bug-hunt fixes, 2026-10-30
+
+- App now self-identifies as v2.0.2: GUI header, `__version__`, and embedded
+  Windows version resource (FileVersion/ProductVersion 2.0.2.0)
+
+Three real defects found by code audit + synthetic reproduction tests (suite in `tests/test_bugs.py`, 13 checks incl. live Sony/TMDB probes). Full analysis: `BUGFIXES-v2.0.2.md`.
+
+### Fixed
+
+- `read_sfo_strings` (scanner): the v2.0.1 probe only understood entry tables at offset 32 with a 3-int entry read. Canonical PS3 `PARAM.SFO` files keep their entry table at `header_size` (0x80) with 46-byte entries laid out format/flag/offset/size, and `data_start` of any game with ≥9 entries exceeds the old 512-byte cap — all of those still returned `{}`. Layout is now probed from the header fields (base + stride candidates) with a 4-int canonical entry read first; a validating layout is still never guessed. Regression tests: 4-entry and 20-entry canonical fixtures + the 32-byte-header variant.
+- `download_pkg` (core): a CDN that closes the stream cleanly after a short body left a truncated `.pkg` renamed to the final name and reported **ok** when Sony's listing carried no SHA-1 — the user then installs a broken package in RPCS3. Completed-byte count is now checked against `Content-Length` in the no-SHA-1 case; short files are deleted and reported `incomplete download (done/total bytes)`.
+- `load_config` (config): the v2.0.1 fix covered the save path only. A hand-edited `config.ini` with non-numeric `max_downloads` (`ValueError`) or duplicate sections (`DuplicateSectionError`) crashed the GUI at startup with no recovery. Reads are now guarded and fall back to defaults.
+
+### Added
+
+- `tests/test_bugs.py`: regression suite reproducing each bug (including a reconstruction of the shipped v2.0.1 SFO parser asserting it fails the valid fixture) plus live PSN/TMDB endpoint probes. Run: `python tests/test_bugs.py` (needs `requests`, `yaml`).
+
 ## v2.0.1 — 2026-10-11
 
 Hotfix release: library scanning, title lookup, and the GUI search/filter flow.
