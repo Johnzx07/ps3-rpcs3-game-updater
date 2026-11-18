@@ -1,5 +1,39 @@
 # Changelog
 
+## [v2.0.3] - 2026-11-17 — bug fixes + community buttons
+
+New suite: `tests/test_v203.py` (7 checks, offline). Each bug reproduced RED
+with shipped code, fixed, re-run GREEN. Old suite `tests/test_bugs.py` still
+13/13.
+
+### Added
+
+- Header **YouTube** button (red play-badge glyph) opens the main channel
+  [@TheNewGamePluss](https://www.youtube.com/@TheNewGamePluss) in the default browser.
+- Header **Ko-fi** button (cup glyph) opens
+  [ko-fi.com/thenewgameplus](https://ko-fi.com/thenewgameplus) for donations.
+- Both glyphs are SVG masters under `assets/svg/` (recolor-friendly), rasterised to
+  `assets/youtube_24.png` / `kofi_24.png` by `tools/write_glyph_svgs.py` +
+  `tools/compose_glyphs.py`; buttons fall back to plain text labels if Pillow or a
+  glyph is missing, so the links can never vanish.
+- App now self-identifies as v2.0.3 (header, `__version__`, Windows version resource).
+
+### Fixed
+
+- `read_sfo_strings` callers missed real card data (scanner `_folder_game_info`): RPCS3 names installed game-data folders by content id (`BCUS98174GDAI32`), whose first 9 chars ARE the title id — the old code uppercased the whole folder name, producing an invalid serial that could only fail lookup and duplicated the same game as a second card; disc-layout SFOs live inside `PS3_GAME/PARAM.SFO`, which was never read, leaving those cards nameless. Serial now falls back to the embedded title id, the nested SFO is read, and unsalvageable folder names are dropped. This was the "New observation (candidate v2.0.3 fix)" in `BUGFIXES-v2.0.2.md`.
+- `download_batch` (downloader) reported the PLANNED destination path instead of the file `download_pkg` actually saved (URL basename; the two differ for DRM-free entries, "DRM-Free <file>"). The GUI filters completed paths with `is_file()` before offering the RPCS3 installer, so DRM-free-only downloads never offered install and the activity log named a file that did not exist. Results now carry the real path.
+- `make_placeholder` (artwork) crashed with `UnboundLocalError` when `Draw.textbbox` raised: the `except` fallback positioned text with `bbox[0]/bbox[1]`, but `bbox` was only bound inside the `try` that had just failed. `bbox` now defaults before the try, so the initials placeholder still renders on any font-metrics failure.
+
+### Checked, no defect found (round 3)
+
+- PSN XML dedupe, fetch_updates/fetch_meta contracts, TMDB HMAC key, config load/save guards, download truncation guard, sha1 warn-but-keep policy, engine stop/cancel + byte banking, _MEIPASS DLL-dir hygiene, GUI event-pump guards, version sorting (leading-zero strings vs int keys), is_valid_serial vs fetch_updates regex parity.
+
+### Notes
+
+- `_installed_version_from_folder` returns the highest version directory present and deliberately ignores update-only folders lacking PARAM.SFO — correct, covered by design.
+
+Shipped as GitHub release **v2.0.3** (2026-11-17) with asset `ps3-rpcs3-game-updater.exe` (SHA-256 `4cea8712bc5a60c685e5b75ca0bc16abae8c83794db6bb652a16aa9072187da0`); release notes embed the new header and game-details screenshots.
+
 ## [v2.0.2] - 2026-10-30 — bug-hunt fixes, 2026-10-30
 
 - App now self-identifies as v2.0.2: GUI header, `__version__`, and embedded

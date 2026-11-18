@@ -253,6 +253,9 @@ def make_placeholder(title: str = "", size=(360, 500)) -> Optional["Image.Image"
         d.line([(i, h), (i + h, 0)], fill=(70, 130, 255, 18), width=2)
 
     initials = _initials(title) or "?"
+    # Fallback-safe bbox: the exception path below positions text with
+    # bbox[0]/bbox[1], which must exist even when textbbox itself failed.
+    bbox = (0, 0, 0, 0)
     font = None
     for path in (
         r"C:\Windows\Fonts\segoeuib.ttf",

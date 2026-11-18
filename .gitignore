@@ -55,3 +55,7 @@ build/*.exe
 # Windows temp files
 *.tmp
 ~$*
+
+# Agent work artifacts (kept local, not published)
+.hermes/
+tools/

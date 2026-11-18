@@ -58,5 +58,10 @@ def download_batch(
         path, ok, msg = download_pkg(
             pkg, dest_path.parent, progress_cb=_cb, stop_event=stop_event
         )
-        results.append((str(dest_path), ok, msg))
+        # download_pkg names the saved file from the URL basename, which
+        # differs from the planned destination for DRM-free entries
+        # ("DRM-Free <file>"). Report the ACTUAL path: the GUI filters the
+        # completed list with is_file() before offering the RPCS3 install,
+        # so the nonexistent planned name silently killed that offer.
+        results.append((path or str(dest_path), ok, msg))
     return results

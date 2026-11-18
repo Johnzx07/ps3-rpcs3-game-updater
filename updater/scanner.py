@@ -355,6 +355,14 @@ def _folder_game_info(folder: str) -> Optional[GameInfo]:
     if not (has_ps3_game or os.path.isfile(sfo_path)):
         return None
 
+    # Disc-layout games keep their PARAM.SFO inside PS3_GAME/, not at the
+    # folder root; when the root SFO is absent read the nested one so the
+    # card still gets the real title instead of a nameless red card.
+    if not os.path.isfile(sfo_path):
+        nested = os.path.join(folder, "PS3_GAME", "PARAM.SFO")
+        if os.path.isfile(nested):
+            sfo_path = nested
+
     title = ""
     serial = name.upper()
     if os.path.isfile(sfo_path):
@@ -363,6 +371,18 @@ def _folder_game_info(folder: str) -> Optional[GameInfo]:
         sfo_serial = (strings.get("SERIAL") or "").upper()
         if is_valid_serial(sfo_serial):
             serial = sfo_serial
+
+    if not is_valid_serial(serial):
+        # RPCS3 names installed game-data folders by content id — title id
+        # plus a suffix, e.g. BCUS98174GDAI32 — whose first 9 chars ARE the
+        # title id. Recover it; otherwise drop the folder: its card could
+        # only ever fail lookup ("Invalid serial format") and would also
+        # duplicate the games.yml entry for the same title.
+        prefix = serial[:9]
+        if is_valid_serial(prefix):
+            serial = prefix
+        else:
+            return None
 
     return GameInfo(
         serial=serial,

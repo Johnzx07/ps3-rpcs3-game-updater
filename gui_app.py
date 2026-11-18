@@ -14,6 +14,7 @@ import queue as _queue
 import subprocess
 import sys
 import threading
+import webbrowser
 import ctypes
 import tkinter as tk
 from datetime import datetime
@@ -65,11 +66,29 @@ def _log_uncaught(exc: BaseException, where: str):
 
 
 APP_TITLE = "PS3 RPCS3 Game Updater"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 # These assets are bundled alongside the executable by ps3-rpcs3-game-updater.spec.
-# Keep the source and frozen-app lookup identical by resolving from this module.
-BRAND_PNG = os.path.join(_ROOT, "assets", "logo_header.png")
-ICON_PATH = os.path.join(_ROOT, "assets", "app.ico")
+# In a PyInstaller ONE-FILE build the data files live in the runtime extraction
+# folder (sys._MEIPASS), NOT next to the exe or this module - resolving from
+# __file__ there pointed at a path that never exists, so glyphs silently fell
+# back to text (v2.0.3 bug found in the release-candidate screenshot). The
+# helper below returns _MEIPASS when frozen and the source dir when running
+# from source, so both modes see the real files.
+if getattr(sys, "frozen", False):
+    _ASSETS = os.path.join(getattr(sys, "_MEIPASS", _ROOT), "assets")
+else:
+    _ASSETS = os.path.join(_ROOT, "assets")
+BRAND_PNG = os.path.join(_ASSETS, "logo_header.png")
+ICON_PATH = os.path.join(_ASSETS, "app.ico")
+
+# Community links (v2.0.3): header buttons open these in the default browser.
+# The glyph PNGs are rasterised from the SVG masters in assets/svg/ (see
+# tools/write_glyph_svgs.py + tools/compose_glyphs.py); the app runs on the PNGs
+# because tkinter draws bitmaps, not vectors.
+YOUTUBE_URL = "https://www.youtube.com/@TheNewGamePluss"
+KOFI_URL = "https://ko-fi.com/thenewgameplus"
+YOUTUBE_PNG = os.path.join(_ASSETS, "youtube_24.png")
+KOFI_PNG = os.path.join(_ASSETS, "kofi_24.png")
 
 # ---------------------------------------------------------------- palette ---
 C_BG = "#0b0e14"        # app background (near-black navy)
@@ -237,6 +256,47 @@ def _flat_button(parent, text, command, accent=False):
         padx=10, pady=5,
     )
 
+def _open_url(url: str):
+    """Open an external link in the default browser; never raises."""
+    try:
+        webbrowser.open(url)
+    except Exception:  # noqa: BLE001 - a missing browser must not break the app
+        pass
+
+
+def _brand_button(parent, png_path, text, url):
+    """Flat dark button: brand glyph + label, opens an external link.
+
+    Falls back to the plain text label when Pillow or the glyph is missing,
+    so the link can never disappear from the UI.
+    """
+    btn = tk.Button(
+        parent, text=text, command=lambda: _open_url(url), bd=0, cursor="hand2",
+        font=_font(9), bg=C_CARD_HI, fg=C_TEXT,
+        activebackground="#28324a", activeforeground="#ffffff",
+        padx=10, pady=5,
+    )
+    # Prefer Tk's native PNG loader (Tk 8.6 reads PNG directly - no Pillow in
+    # the loop); fall back to Pillow; and if both fail, leave a breadcrumb in
+    # errors.log so a silent text-only button is always diagnosable.
+    photo = None
+    if os.path.isfile(png_path):
+        try:
+            photo = tk.PhotoImage(file=png_path)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                if _PILImage is not None and _ImageTk is not None:
+                    photo = _ImageTk.PhotoImage(_PILImage.open(png_path).convert("RGBA"))
+            except Exception:  # noqa: BLE001
+                _log_uncaught(exc, "brand-glyph %s" % os.path.basename(png_path))
+    if photo is not None:
+        # NOTE: no spacing= here - this Python is Tk 9, where tk.Button lost
+        # -spacing (raises TclError "unknown option -spacing", which is what
+        # silently text-only'd the first three v2.0.3 builds). compound=left
+        # already leaves Tk's own image-text gap.
+        btn.configure(image=photo, compound="left")
+        btn._glyph_photo = photo  # keep a reference: PhotoImage dies if GC'd
+    return btn
 
 # -------------------------------------------------------------------- app ---
 class PS3RPCS3GameUpdaterApp:
@@ -367,6 +427,13 @@ class PS3RPCS3GameUpdaterApp:
         rescan_btn.pack(side="right", padx=(0, 12))
         settings_btn = _flat_button(header, "⚙  Settings", lambda: self.show_settings())
         settings_btn.pack(side="right", padx=(0, 8))
+
+        # Community links. Packed right-to-left after Rescan/Settings, so the
+        # visible order is YouTube, Ko-fi, Settings, Rescan.
+        kofi_btn = _brand_button(header, KOFI_PNG, "Ko-fi", KOFI_URL)
+        kofi_btn.pack(side="right", padx=(0, 6))
+        yt_btn = _brand_button(header, YOUTUBE_PNG, "YouTube", YOUTUBE_URL)
+        yt_btn.pack(side="right", padx=(0, 18))
 
     def _build_toolbar(self):
         bar = tk.Frame(self.root, bg=C_BG)
