@@ -8,9 +8,9 @@ It does not need a PlayStation account, modify game content, or bypass DRM. Use 
 
 ## Download v2
 
-Download **`ps3-rpcs3-game-updater.exe`** from the [v2.0.2 release](https://github.com/Johnzx07/ps3-rpcs3-game-updater/releases/tag/v2.0.2), then double-click it. The build is self-contained; Windows may show a SmartScreen notice because this is an unsigned community application.
+Download **`ps3-rpcs3-game-updater.exe`** from the [v2.0.3 release](https://github.com/Johnzx07/ps3-rpcs3-game-updater/releases/tag/v2.0.3), then double-click it. The build is self-contained; Windows may show a SmartScreen notice because this is an unsigned community application.
 
-The release also includes `SHA256SUMS.txt`. The v2.0.2 executable SHA-256 is `2a4e34fd3be8dea7c2f6fe435d68bfd9a15c9e536999727bab519901f67b128a`.
+The release also includes `SHA256SUMS.txt`. The v2.0.3 executable SHA-256 is `4cea8712bc5a60c685e5b75ca0bc16abae8c83794db6bb652a16aa9072187da0`.
 
 ## What is new in v2
 
